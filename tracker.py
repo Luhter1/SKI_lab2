@@ -33,12 +33,14 @@ class KeypointTracker:
     def __init__(
         self,
         template_img,
-        n_features=1000,
-        ratio=0.75,
-        min_inliers=15,
-        min_matches=10,
+        n_features=3000,
+        ratio=0.85,
+        min_inliers=6,
+        min_matches=4,
         scale_factor=1.2,
         nlevels=12,
+        crosscheck=True,
+        ransac_thresh=5.0,
     ):
         # Расширенная пирамида масштабов: 1.2^11 ~ 7.4x покрытия по масштабу,
         # что позволяет находить объект при сильном уменьшении (приближении/удалении).
@@ -47,10 +49,19 @@ class KeypointTracker:
             scaleFactor=scale_factor,
             nlevels=nlevels,
         )
-        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=crosscheck)
+        self.crosscheck = crosscheck
         self.ratio = ratio
         self.min_inliers = min_inliers
         self.min_matches = min_matches
+        self.ransac_thresh = ransac_thresh
+
+        # Матчер для взаимного сопоставления соседних кадров (временной трекинг).
+        self._cc_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        # Состояние временного трекинга: предыдущий кадр и последняя гомография.
+        self._prev_des = None
+        self._prev_kp = None
+        self._H_ref = None
 
         # Эталоном является само переданное изображение объекта.
         self.template = template_img
@@ -61,6 +72,7 @@ class KeypointTracker:
 
         # Углы эталона (границы объекта), которые проецируются на кадр.
         h, w = self.template_gray.shape[:2]
+        self.frame_area = h * w
         self.template_corners = np.float32(
             [[0, 0], [w, 0], [w, h], [0, h]]
         ).reshape(-1, 1, 2)
@@ -83,6 +95,13 @@ class KeypointTracker:
             return None, None, 0, 0
 
         self.raw_matches = len(self.template_descriptors)
+        if self.crosscheck:
+            # Взаимный поиск ближайшего соседа уже отсеял ложные совпадения,
+            # ratio-тест не требуется.
+            matches = self.matcher.match(self.template_descriptors, frame_descriptors)
+            good = list(matches)
+            self.good_matches = len(good)
+            return frame_keypoints, frame_descriptors, good, self.good_matches
         # k=2 — нужно для ratio-теста (два ближайших соседа).
         matches = self.matcher.knnMatch(self.template_descriptors, frame_descriptors, k=2)
 
@@ -96,12 +115,83 @@ class KeypointTracker:
         self.good_matches = len(good)
         return frame_keypoints, frame_descriptors, good, self.good_matches
 
+    def _area_ok(self, projected):
+        """Рамка не должна резко менять размер между соседними кадрами."""
+        if self.last_box is None:
+            return True
+        a = abs(cv2.contourArea(np.int32(projected)))
+        pa = abs(cv2.contourArea(np.int32(self.last_box)))
+        if pa > 0:
+            ratio = a / pa
+            if ratio > 3.0 or ratio < 1.0 / 3.0:
+                return False
+        return True
+
+    def _temporal_ok(self, projected):
+        """Временная согласованность рамки с предыдущим кадром: похожий размер
+        и не слишком большой скачок центра. Отсекает ложные детекции, «прыгающие»
+        на другие напечатанные изображения в кадре."""
+        if self.last_box is None:
+            return True
+        if not self._area_ok(projected):
+            return False
+        c = projected.reshape(4, 2).mean(axis=0)
+        pc = np.array(self.last_box).mean(axis=0)
+        diag = np.linalg.norm(
+            np.array(self.last_box[0]) - np.array(self.last_box[2])
+        )
+        if diag <= 0:
+            return True
+        return np.hypot(c[0] - pc[0], c[1] - pc[1]) <= 1.0 * diag
+
+    def _propagate(self, frame_kp, frame_des):
+        """Временная пропагация рамки через гомографию между соседними кадрами.
+
+        Если прямое сопоставление с эталоном слабое (объект мал/размыт), но в
+        предыдущем кадре рамка уже была построена, переносим её на текущий кадр
+        по гомографии предыдущий->текущий кадр. Чтобы рамка не «раздувалась»
+        из-за преобладающих на фоне точек, учитываются только совпадения внутри
+        предыдущей рамки объекта.
+        """
+        if (
+            self._H_ref is None
+            or self.last_box is None
+            or self._prev_des is None
+            or frame_des is None
+            or len(self._prev_des) < 4
+            or len(frame_des) < 4
+        ):
+            return None, None, 0
+        matches = self._cc_matcher.match(self._prev_des, frame_des)
+        poly = np.int32(self.last_box)
+        kept = [
+            m for m in matches
+            if cv2.pointPolygonTest(poly, self._prev_kp[m.queryIdx].pt, False) >= 0
+        ]
+        if len(kept) < 6:
+            return None, None, 0
+        src = np.float32(
+            [self._prev_kp[m.queryIdx].pt for m in kept]
+        ).reshape(-1, 1, 2)
+        dst = np.float32(
+            [frame_kp[m.trainIdx].pt for m in kept]
+        ).reshape(-1, 1, 2)
+        h_prev_cur, mask = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
+        if h_prev_cur is None:
+            return None, None, 0
+        h_cur = h_prev_cur @ self._H_ref  # эталон -> текущий кадр
+        projected = cv2.perspectiveTransform(self.template_corners, h_cur)
+        if not self._box_valid(projected) or not self._temporal_ok(projected):
+            return None, None, 0
+        return h_cur, projected, int(mask.sum())
+
     def track(self, frame):
         """Обрабатывает кадр, возвращает копию с нарисованной рамкой (или без неё)."""
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        frame_keypoints, _, good, n_good = self._match(frame_gray)
+        frame_keypoints, frame_descriptors, good, n_good = self._match(frame_gray)
         result = frame.copy()
         found = False
+        H = None
 
         if n_good >= self.min_matches:
             src_pts = np.float32(
@@ -112,17 +202,37 @@ class KeypointTracker:
             ).reshape(-1, 1, 2)
 
             homography, mask = cv2.findHomography(
-                src_pts, dst_pts, cv2.RANSAC, 5.0
+                src_pts, dst_pts, cv2.RANSAC, self.ransac_thresh
             )
             if homography is not None:
                 self.inliers = int(mask.sum())
-                if self.inliers >= self.min_inliers:
-                    projected = cv2.perspectiveTransform(
-                        self.template_corners, homography
-                    )
+                projected = cv2.perspectiveTransform(
+                    self.template_corners, homography
+                )
+                if self.inliers >= self.min_inliers and self._box_valid(projected) \
+                        and self._temporal_ok(projected):
                     self.last_box = projected.reshape(4, 2)
                     result = self._draw_box(result, projected, (0, 255, 0))
                     found = True
+                    H = homography
+
+        if not found:
+            # Прямое сопоставление не дало устойчивой рамки — пробуем перенести
+            # её из предыдущего кадра (временной трекинг).
+            H, projected, n_inl = self._propagate(
+                frame_keypoints, frame_descriptors
+            )
+            if H is not None:
+                self.inliers = n_inl
+                self.last_box = projected.reshape(4, 2)
+                result = self._draw_box(result, projected, (0, 255, 0))
+                found = True
+
+        # Обновляем состояние для следующего кадра.
+        self._prev_des = frame_descriptors
+        self._prev_kp = frame_keypoints
+        if found:
+            self._H_ref = H
 
         if not found:
             # Объект не найден — рисуем информационную подпись.
@@ -138,6 +248,22 @@ class KeypointTracker:
                 2,
             )
         return result, found
+
+    def _box_valid(self, projected):
+        """Геометрическая проверка рамки: выпуклый четырёхугольник разумного
+        размера и пропорций. Отсекает вырожденные/ложные гомографии (точка,
+        вытянутая полоса, гигантский или крошечный четырёхугольник)."""
+        pts = projected.reshape(4, 2)
+        if not cv2.isContourConvex(np.int32(pts)):
+            return False
+        area = abs(cv2.contourArea(np.int32(pts)))
+        if area < 800 or area > 0.6 * self.frame_area:
+            return False
+        sides = [np.linalg.norm(pts[(i + 1) % 4] - pts[i]) for i in range(4)]
+        if min(sides) < 15:
+            return False
+        # Не допускаем слишком вытянутые (почти вырожденные) четырёхугольники.
+        return max(sides) / min(sides) <= 5.0
 
     def _draw_box(self, frame, projected, color):
         """Рисует рамку и подпись вокруг найденного объекта."""
